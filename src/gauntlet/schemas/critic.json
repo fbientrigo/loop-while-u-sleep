@@ -1,0 +1,26 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["verdict", "blocking_findings"],
+  "properties": {
+    "verdict": {"enum": ["PASS", "BLOCK"]},
+    "human_decision_required": {"type": "boolean"},
+    "blocking_findings": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["id", "severity", "claim", "evidence", "location", "required_condition"],
+        "properties": {
+          "id": {"type": "string", "minLength": 1},
+          "severity": {"enum": ["critical", "major"]},
+          "claim": {"type": "string", "minLength": 1},
+          "evidence": {"type": "string", "minLength": 1},
+          "location": {"type": "string", "minLength": 1},
+          "required_condition": {"type": "string", "minLength": 1}
+        }
+      }
+    }
+  }
+}

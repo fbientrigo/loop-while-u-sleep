@@ -1,0 +1,17 @@
+[worker]
+provider = "agy"
+model = "gemini-3.8-flash-high"
+effort = "high"
+
+[critic]
+provider = "codex"
+effort = "high"
+
+[[verification.commands]]
+name = "tests"
+argv = ["python", "-m", "pytest", "-q"]
+
+[limits]
+wall_time = "4h"
+max_worker_turns = 20
+same_blocker_limit = 3
