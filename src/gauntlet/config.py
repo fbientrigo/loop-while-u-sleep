@@ -27,12 +27,17 @@ class Limits:
         return parse_duration(self.wall_time)
 
 
+MODEL_SLUG_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
+
+
 @dataclass(frozen=True)
 class Config:
     worker_model: str
     critic_model: str | None
     verification: tuple[VerificationCommand, ...]
     limits: Limits = Limits("4h", 20, 3)
+    worker_effort: str = "high"
+    critic_effort: str = "high"
 
 
 DEFAULT_CONFIG = '''[worker]
@@ -95,9 +100,14 @@ def parse_config(text: str) -> Config:
     if worker.get("effort") not in {"low", "medium", "high"} or critic.get("effort") not in {"low", "medium", "high"}:
         raise ConfigError("worker.effort and critic.effort must be low, medium, or high")
     worker_model = _string(worker, "model")
+    if worker_model != "fake" and not worker_model.startswith("fake") and not MODEL_SLUG_PATTERN.fullmatch(worker_model):
+        raise ConfigError(f"worker.model must be a plain model slug: {worker_model!r}")
     critic_model = critic.get("model")
-    if critic_model is not None and not isinstance(critic_model, str):
-        raise ConfigError("critic.model must be a string")
+    if critic_model is not None:
+        if not isinstance(critic_model, str) or not critic_model:
+            raise ConfigError("critic.model must be a non-empty string")
+        if not MODEL_SLUG_PATTERN.fullmatch(critic_model):
+            raise ConfigError(f"critic.model must be a plain model slug: {critic_model!r}")
     commands = _table(data, "verification").get("commands", [])
     if not isinstance(commands, list):
         raise ConfigError("verification.commands must be an array of tables")
@@ -114,7 +124,14 @@ def parse_config(text: str) -> Config:
         max_worker_turns=limits["max_worker_turns"],
         same_blocker_limit=limits["same_blocker_limit"],
     )
-    return Config(worker_model, critic_model, verified, limits=parsed_limits)
+    return Config(
+        worker_model,
+        critic_model,
+        verified,
+        limits=parsed_limits,
+        worker_effort=worker["effort"],
+        critic_effort=critic["effort"],
+    )
 
 
 def init_config(path: Path) -> None:

@@ -255,8 +255,16 @@ class FoundationTests(unittest.TestCase):
             run = next((root / ".gauntlet" / "runs").iterdir())
             run_id = run.name
 
-            # 2. Live adapter not implemented in Phase 2A raises NotImplementedError -> exit code 2
-            with patch("gauntlet.cli.Path.cwd", return_value=root):
+            # 2. Live provider doctor check fails closed (unproven read-only sandbox /
+            # unconfigured critic model) -> exit code 2. Point agy/codex resolution at a
+            # nonexistent path (never a bare "agy"/"codex" that the OS could still find
+            # on PATH) so this never launches a real installed provider executable.
+            missing_exe = str(root / "no-such-provider-executable")
+            with (
+                patch("gauntlet.cli.Path.cwd", return_value=root),
+                patch("gauntlet.cli.shutil.which", return_value=missing_exe),
+                patch("gauntlet.doctor.shutil.which", return_value=missing_exe),
+            ):
                 self.assertEqual(main(["resume", run_id]), 2)
 
             # 3. Update frozen config to use worker model "fake" and a passing verification command

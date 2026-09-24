@@ -33,50 +33,75 @@ read-only critic (`codex`).  Provider adapters construct argument arrays and
 parse their own output; the state machine never parses prose to decide a
 terminal state.
 
-## Verified provider contract (2026-09-17)
+## Verified provider contract (2026-09-24, Phase 2B1)
 
-The installed `agy` is 1.2.5.  Its `--help` and `agy models` confirm:
+The installed `agy` is 1.2.9.  Its `--help` and `agy models` confirm:
 
-- `agy -p` is headless; JSON and NDJSON are available through
-  `--output-format json|stream-json`.
-- `--json-schema` enforces structured final output, and the requested worker
-  slug is exactly `gemini-3.8-flash-high`.
-- `--conversation ID` and `--continue` continue an Agy conversation.  v1 uses
-  an individual worker conversation only across that run's worker revisions;
-  it never reuses a conversation across runs.
-- `--effort high`, `--mode accept-edits`, `--sandbox`, and an explicit
-  `--dangerously-skip-permissions` flag exist.  Gauntlet never supplies the
-  dangerous bypass flag.  The worker permission policy must be diagnosed and
-  recorded before a live run.
-- `agy plugin` supports install, enable, disable, validate, and list.  Agy
-  documentation says a plugin can bundle skills, agents, rules, MCP, and
-  hooks.
+- `agy -p`/`--print` is headless; `--output-format json` returns one JSON
+  object: `{"status":"SUCCESS"|..., "response":..., "conversation_id":...,
+  "error"?:...}`.
+- `--model`, `--effort low|medium|high`, `--print-timeout`,
+  `--mode accept-edits`, `--disable-slash-commands`, and `--add-dir` are all
+  real flags.  The worker slug is read from `[worker].model` and validated
+  against `agy models`, never hard-coded.
+- `--conversation ID` resumes a specific Agy conversation.  `AgyAdapter`
+  stores the id returned on turn 1 in `worker-conversation.json` under the run
+  directory (`{"provider":"agy","run_id":...,"conversation_id":...}`) and
+  passes it back on every later turn of that same run.  Missing/malformed
+  state on turn > 1, a run-id mismatch, or the provider returning a different
+  id than supplied all fail the turn closed rather than guessing; `--continue`
+  ("most recent conversation", which can cross runs) is never used.
+- `--dangerously-skip-permissions` exists.  Gauntlet never supplies it.
 
-The installed Codex CLI is 0.154.0.  `codex exec` supports `-m`,
-`-s read-only`, `-a never`, `--ephemeral`, `--ignore-user-config`,
-`--ignore-rules`, `--output-schema FILE`, and JSONL `--json`.  The local
-configuration selects `gpt-5.6-terra`; that is a local configured slug, not a
-portable hard-coded default.  `codex debug models` confirms that this model
-accepts high reasoning; the adapter supplies it as
-`-c model_reasoning_effort="high"`.  `codex review` does not expose a sandbox flag,
-so it is not the v1 critic launch surface.
+The installed Codex CLI is 0.156.1.  `-a`/`--ask-for-approval` is a **top-level
+flag**, not an `exec` flag — `codex exec -a never` exits 2; the correct order
+is `codex -a never exec ...`.  `codex exec` supports `-C`, `-m`, `-c`,
+`-s read-only`, `--ephemeral`, `--ignore-user-config`, `--ignore-rules`,
+`--output-schema FILE`, `-o/--output-last-message FILE`, and
+`--skip-git-repo-check` (smoke-test only, so the doctor probe can run inside a
+disposable non-Git temp directory).  `[critic].model` is a local configured
+slug (currently `gpt-5.6-terra` in this environment) resolved and recorded by
+`doctor`, never guessed by pattern-matching provider output.  `codex debug
+models` returns JSON with `slug` and `supported_reasoning_levels`; the
+adapter supplies effort as `-c model_reasoning_effort="<effort>"` only after
+confirming that level is listed.  `codex review` does not expose a sandbox
+flag and is not used; `resume`/`fork`/`--last` are never used either — every
+critic call is a brand-new `codex exec` process, no session id retained.
 
-The intended critic command is conceptually:
+The real critic command:
 
 ```text
-codex exec -C <repo> -m <detected-model> -c model_reasoning_effort="high" \
-  -s read-only -a never --ephemeral \
-  --ignore-user-config --ignore-rules --output-schema <verdict-schema.json> --json -
+codex -a never exec -C <worktree> -m <critic-model> -c model_reasoning_effort="<effort>" \
+  -s read-only --ephemeral --ignore-user-config --ignore-rules \
+  --output-schema <schemas/critic.json> -o <fresh tempdir>/verdict.json --color never -
 ```
+
+with the prompt on stdin (`-`).  `CodexAdapter` reads the raw verdict from the
+`-o` file only, never from stdout; extra stdout prose is captured for audit
+but has no verdict authority.  A missing `-o` file after exit 0 is treated as
+adapter failure, not a passing/empty verdict.  A fresh temporary `-o` path is
+used for every single call.
 
 The supervisor writes artifacts itself from captured stdout; it does not give
 the critic a writable artifact directory.  A before/after content manifest of
 the repository is a second guard, but it is detection, not a substitute for a
-working sandbox.  The current Windows `codex doctor` reports unrestricted
-filesystem/sandbox-provisioning failure, so v1 must refuse live critic runs on
-that machine.  `gauntlet doctor` on Debian will run a disposable write-attempt
-smoke test and require both CLI enforcement and an unchanged manifest before
-it reports the critic safe.
+working sandbox.  `gauntlet doctor`/`resume` refuse to construct a live
+`CodexAdapter` with `read_only_proven=True` unless the current platform is
+POSIX and the disposable write-attempt smoke test observed both an unchanged
+manifest and an explicit denial signal (`Read-only file system`, `Permission
+denied`, etc.) in the process output.  Windows always reports
+`codex_read_only` as `UNPROVEN` and `doctor().safe == False`, regardless of
+whether `agy`/`codex` happen to be installed locally; only a live Debian/Linux
+smoke test (Phase 2B2) can prove it.  Both adapters also refuse to launch an
+executable resolved to a `.cmd`/`.bat` path, since Windows silently routes
+those through `cmd.exe` even with `shell=False`, which would reintroduce
+shell-quoting risk for argv values such as prompts and model slugs.
+
+A frozen-artifact digest guard (`frozen-digests.json`, SHA-256 of
+`config.toml`/`task.md`/`task-contract.json`) is recorded once and re-checked
+at supervisor start and after every worker/critic call; any mismatch escalates
+(`FROZEN_ARTIFACT_MUTATED`) rather than continuing, on top of the existing
+worktree manifest guard.
 
 Sources: [Antigravity headless mode](https://www.agy.dev/docs/cli/headless/),
 [Antigravity features](https://www.agy.dev/docs/cli/features),

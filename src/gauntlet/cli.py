@@ -3,10 +3,11 @@ from __future__ import annotations
 import argparse
 import json
 from pathlib import Path
+import shutil
 import sys
 
 from .config import ConfigError, init_config, load_config
-from .doctor import doctor
+from .doctor import critic_read_only_status, doctor
 from .process import SubprocessRunner
 from .providers import get_adapters
 from .store import RunStore, StoreError
@@ -60,10 +61,32 @@ def main(argv: list[str] | None = None) -> int:
             task_path = store.root / "task-contract.json"
             if not config_path.exists() or not task_path.exists():
                 raise ValueError(f"run {args.run_id} is missing frozen configuration or task contract")
-            store.event("RUN_RESUMED", status="RUNNING", detail={"previous_status": current_status})
             frozen_config = load_config(config_path)
-            worker, critic = get_adapters(frozen_config)
-            supervisor = Supervisor.from_store(store, worktree, SubprocessRunner(), worker, critic)
+            runner = SubprocessRunner()
+            is_fake = frozen_config.worker_model == "fake" or frozen_config.worker_model.startswith("fake")
+            if is_fake:
+                worker, critic = get_adapters(frozen_config)
+            else:
+                agy_cmd = (shutil.which("agy") or "agy",)
+                codex_cmd = (shutil.which("codex") or "codex",)
+                report = doctor(frozen_config, runner, agy_cmd, codex_cmd)
+                if not report.safe:
+                    raise ValueError(
+                        f"doctor reports live providers are not safe/ready to resume run {args.run_id}: "
+                        f"codex_read_only={report.codex_read_only!r} "
+                        f"worker_model_detected={report.worker_model_detected} "
+                        f"critic_model_detected={report.critic_model_detected}"
+                    )
+                worker, critic = get_adapters(
+                    frozen_config,
+                    store=store,
+                    runner=runner,
+                    critic_read_only_proven=critic_read_only_status(report),
+                    agy_command=agy_cmd,
+                    codex_command=codex_cmd,
+                )
+            store.event("RUN_RESUMED", status="RUNNING", detail={"previous_status": current_status})
+            supervisor = Supervisor.from_store(store, worktree, runner, worker, critic)
             final_status = supervisor.run()
             print(json.dumps(final_status, indent=2, sort_keys=True))
             return 0 if final_status.get("status") == STATUS_DONE else 1

@@ -187,12 +187,42 @@ class Supervisor:
         )
         return cls(store, config, task, worktree, runner, worker, critic, clock=clock)
 
+    FROZEN_ARTIFACTS = ("config.toml", "task.md", "task-contract.json")
+
+    def _frozen_digests(self) -> dict[str, str]:
+        digests = {}
+        for name in self.FROZEN_ARTIFACTS:
+            path = self.store.root / name
+            if path.exists():
+                digests[name] = hashlib.sha256(path.read_bytes()).hexdigest()
+        return digests
+
+    def _check_frozen_artifacts(self) -> bool:
+        """CONSTITUTIONAL PROPERTY: providers cannot mutate frozen task/config artifacts."""
+        digests_file = self.store.root / "frozen-digests.json"
+        current = self._frozen_digests()
+        if not digests_file.exists():
+            self.store.freeze_json("frozen-digests.json", current)
+            return True
+        recorded = json.loads(digests_file.read_text(encoding="utf-8"))
+        if recorded != current:
+            self.store.event(
+                "FROZEN_ARTIFACT_MUTATED",
+                status="ESCALATED",
+                detail={"recorded": recorded, "current": current},
+            )
+            return False
+        return True
+
     def run(self) -> dict[str, Any]:
         """Execute the supervisor state machine until a terminal state is reached."""
         status = self.store.status()
         current_status = status.get("status")
         if current_status in {"DONE", "BLOCKED", "ESCALATED"}:
             return status
+
+        if not self._check_frozen_artifacts():
+            return self.store.status()
 
         events = self.store.events()
         event_kinds = [e["kind"] for e in events]
@@ -364,6 +394,9 @@ class Supervisor:
                     if worker_result.error:
                         self.store.freeze_text(f"worker-turn-{turn}-stderr.txt", worker_result.error)
 
+                    if not self._check_frozen_artifacts():
+                        return self.store.status()
+
                 # Check wall-time deadline immediately after worker execution
                 elapsed = recorded_elapsed + (self.clock() - start_clock)
                 if elapsed >= self.config.limits.wall_time_seconds:
@@ -507,6 +540,9 @@ class Supervisor:
                             status="ESCALATED",
                             detail={"turn": turn, "diff": diff},
                         )
+                        return self.store.status()
+
+                    if not self._check_frozen_artifacts():
                         return self.store.status()
 
                     # Check wall-time deadline immediately after critic execution
