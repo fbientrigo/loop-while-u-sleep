@@ -373,9 +373,20 @@ class Supervisor:
                         detail={"turn": turn, "reason": "unrecorded_worker_exit_status"},
                     )
                     return self.store.status()
+                elif any(
+                    e["kind"] == "WORKER_STARTED" and e.get("detail", {}).get("turn") == turn
+                    for e in self.store.events()
+                ):
+                    # The former process may have changed the worktree or reached external tools.
+                    # A missing durable result is UNKNOWN, not permission to launch it again.
+                    self.store.event(
+                        "WORKER_EXECUTION_UNKNOWN",
+                        status="ESCALATED",
+                        detail={"turn": turn, "reason": "started_without_durable_result"},
+                    )
+                    return self.store.status()
                 else:
-                    if "WORKER_STARTED" not in [e["kind"] for e in self.store.events() if e.get("detail", {}).get("turn") == turn]:
-                        self.store.event("WORKER_STARTED", status="RUNNING", detail={"turn": turn})
+                    self.store.event("WORKER_STARTED", status="RUNNING", detail={"turn": turn})
 
                     worker_result = self.worker.run(
                         worktree=self.worktree,
