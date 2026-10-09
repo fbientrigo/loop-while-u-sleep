@@ -29,6 +29,7 @@ def main(argv: list[str] | None = None) -> int:
     run_parser = commands.add_parser("run", help="freeze a contract and create an isolated worktree; no worker is launched")
     run_parser.add_argument("objective", nargs="?")
     run_parser.add_argument("--task", type=Path)
+    run_parser.add_argument("--execute", action="store_true", help="launch the bounded supervisor after preparing the run")
     args = parser.parse_args(argv)
     try:
         if args.command == "init":
@@ -95,19 +96,23 @@ def main(argv: list[str] | None = None) -> int:
                 raise ValueError("provide exactly one of a short objective or --task TASK.md")
             if args.objective:
                 raise TaskContractError("short objectives require explicit acceptance criteria; use --task TASK.md")
-            _prepare(args.task)
+            store = _prepare(args.task, execute=args.execute)
+            if args.execute:
+                return main(["resume", store.run_id])
     except (ConfigError, FileExistsError, TaskContractError, WorktreeError, ValueError, NotImplementedError) as exc:
         print(f"gauntlet: {exc}", file=sys.stderr)
         return 2
     return 0
 
 
-def _prepare(task_path: Path) -> None:
+def _prepare(task_path: Path, *, execute: bool = False) -> RunStore:
     root = primary_root(Path.cwd(), SubprocessRunner())
     config_path = root / "gauntlet.toml"
     config_text = config_path.read_text(encoding="utf-8")
-    load_config(config_path)
+    config = load_config(config_path)
     contract, task_text = load_task(task_path)
+    if execute and not (config.worker_model == "fake" or config.worker_model.startswith("fake")) and not config.critic_model:
+        raise ConfigError("live --execute requires [critic] model in gauntlet.toml; choose a slug from codex debug models")
     runs_dir = root / ".gauntlet" / "runs"
     if runs_dir.is_dir():
         for run_path in sorted(runs_dir.iterdir()):
@@ -130,7 +135,9 @@ def _prepare(task_path: Path) -> None:
         store.event("SETUP_FAILED", status="BLOCKED", detail={"error": str(exc)})
         raise
     store.event("WORKTREE_CREATED", status="READY", detail={"path": str(worktree)})
-    print(json.dumps(store.status(), indent=2, sort_keys=True))
+    if not execute:
+        print(json.dumps(store.status(), indent=2, sort_keys=True))
+    return store
 
 
 if __name__ == "__main__":
