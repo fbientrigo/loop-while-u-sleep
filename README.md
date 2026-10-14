@@ -6,11 +6,11 @@ This is the **execution layer**, not a general policy engine. [Research Policy E
 
 ## Status
 
-The Python supervisor, worktrees, fake providers, live `agy` and Codex adapters, artifact store, structured critic gate, and `resume` command are implemented. **End-to-end unattended execution with real provider CLIs has not been validated in this repository.** A passing fake-provider test does not establish live operation. There is no background daemon or automatic merge/push.
+Implemented: supervisor, worktrees, fake and live (`agy`, Codex) providers, artifact store, structured critic gate, `resume`, `reconcile`, `status` with heartbeat, protected evaluator files. Real-run evidence is listed in `docs/validation.md`; anything not listed there has **not** been validated. A passing fake-provider test does not establish live operation. There is no daemon and no automatic push or merge.
 
 ## Install and configure
 
-Run on **Debian/Linux** for the live workflow: the Codex read-only sandbox is deliberately treated as unproven on Windows.
+Linux/WSL and Windows are supported. `gauntlet doctor` decides, per machine, whether the Codex critic is provably read-only; if not, live runs refuse to start.
 
 ```sh
 python -m venv .venv
@@ -63,7 +63,38 @@ gauntlet run --task TASK.md --execute
 
 The supervisor runs baseline checks, Gemini worker turns, deterministic checks, independent Codex reviews and final checks. Reaching a worker exit code 0 is **not** completion. Failed checks, unsafe sandbox diagnosis, exceeded limits and malformed reviewer output cannot produce `DONE`. Artifacts are stored under `.gauntlet/runs/RUN_ID`; the detached worktree is a sibling of the target repository. No push, merge or automatic cleanup occurs.
 
-`--execute` **does not create a daemon**. The invoking process must remain alive. For a first live pilot, keep it in a stable terminal/session and use a small turn/wall-time budget. Do not assume restart-safe background execution until an explicit lifecycle test proves it.
+### Evaluator you can trust
+
+The loop is: your natural-language constraints (`TASK.md`) plus a fixed evaluator (`[[verification.commands]]`) that runs after every worker turn. To keep the evaluator fixed:
+
+1. Write the evaluator first (for example `tests/eval_*.py`). A model may draft it from `TASK.md`, but a human reviews and commits it **before** `gauntlet run`.
+2. List it in `gauntlet.toml` so the worker cannot change it:
+
+```toml
+[verification]
+protected = ["tests/eval_*.py"]
+```
+
+If a worker edits, adds or deletes a protected file, the run ends `BLOCKED` with `EVALUATOR_TAMPERED`.
+
+### Unattended runs and recovery
+
+`--execute` runs in the foreground. To survive a disconnect, use tmux (details in [docs/unattended.md](docs/unattended.md)):
+
+```sh
+gauntlet run --task TASK.md                 # prints RUN_ID, prepares only
+tmux new -d -s gauntlet-RUN_ID 'gauntlet resume RUN_ID >> .gauntlet/runs/RUN_ID/session.log 2>&1'
+gauntlet status RUN_ID                      # state, plus supervisor pid and heartbeat age
+```
+
+If the process dies during a worker turn, the next `resume` ends `ESCALATED` (`WORKER_EXECUTION_UNKNOWN`). **The worker is never launched again automatically**, because it may have changed files. Inspect the worktree, then decide:
+
+```sh
+gauntlet reconcile RUN_ID --accept  --note "diff reviewed, keep it"   # resume still runs checks + critic
+gauntlet reconcile RUN_ID --abandon --note "discard"                  # run ends BLOCKED; start a new run
+```
+
+Provider quota or login failures end the run `BLOCKED` with reason `provider_quota` or `provider_auth`. Fix the cause and start a new run.
 
 ## Tests
 
