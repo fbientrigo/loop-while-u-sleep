@@ -38,6 +38,7 @@ class Config:
     limits: Limits = Limits("4h", 20, 3)
     worker_effort: str = "high"
     critic_effort: str = "high"
+    protected: tuple[str, ...] = ()
 
 
 DEFAULT_CONFIG = '''[worker]
@@ -112,6 +113,9 @@ def parse_config(text: str) -> Config:
     if not isinstance(commands, list):
         raise ConfigError("verification.commands must be an array of tables")
     verified = tuple(_command(item) for item in commands)
+    protected = _table(data, "verification").get("protected", [])
+    if not isinstance(protected, list) or any(not isinstance(g, str) or not g or g.startswith(("/", "..")) for g in protected):
+        raise ConfigError("verification.protected must be an array of relative glob strings")
     limits = _table(data, "limits")
     wall_time = _string(limits, "wall_time")
     parse_duration(wall_time)
@@ -131,6 +135,7 @@ def parse_config(text: str) -> Config:
         limits=parsed_limits,
         worker_effort=worker["effort"],
         critic_effort=critic["effort"],
+        protected=tuple(protected),
     )
 
 

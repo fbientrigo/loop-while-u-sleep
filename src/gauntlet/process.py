@@ -6,6 +6,8 @@ from pathlib import Path
 import subprocess
 from typing import Protocol, Sequence
 
+import psutil
+
 
 @dataclass(frozen=True)
 class ProcessResult:
@@ -16,6 +18,24 @@ class ProcessResult:
 
 
 MAX_PROCESS_OUTPUT_CHARS = 500_000
+_NEW_PROCESS_GROUP = 0x00000200  # subprocess.CREATE_NEW_PROCESS_GROUP, spelled out so POSIX imports stay clean
+
+
+def kill_process_tree(process: subprocess.Popen) -> None:
+    """Kill a process and every descendant; a timed-out agent must not leave children running."""
+    try:
+        if os.name != "nt":
+            os.killpg(process.pid, 9)
+            return
+        parent = psutil.Process(process.pid)
+        for child in reversed(parent.children(recursive=True)):
+            try:
+                child.kill()
+            except psutil.Error:
+                pass
+        parent.kill()
+    except (ProcessLookupError, psutil.Error, OSError):
+        pass
 
 
 def bound_output(text: str, max_chars: int = MAX_PROCESS_OUTPUT_CHARS) -> str:
@@ -54,19 +74,34 @@ class SubprocessRunner:
         run_env.setdefault("PYTHONUTF8", "1")
         run_env.setdefault("PYTHONIOENCODING", "utf-8")
         try:
-            completed = subprocess.run(
+            # Own process group so a timeout can stop the whole tree, not only the direct child.
+            with subprocess.Popen(
                 list(argv),
                 cwd=cwd,
-                input=input_text,
+                stdin=subprocess.PIPE if input_text is not None else subprocess.DEVNULL,  # a child must never wait on the operator's terminal
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
                 text=True,
                 encoding="utf-8",
                 errors="replace",
-                capture_output=True,
                 shell=False,
-                check=False,
-                timeout=timeout,
                 env=run_env,
-            )
+                start_new_session=(os.name != "nt"),
+                creationflags=_NEW_PROCESS_GROUP if os.name == "nt" else 0,
+            ) as process:
+                try:
+                    stdout, stderr = process.communicate(input=input_text, timeout=timeout)
+                except BaseException as interruption:
+                    # Ctrl-C reaches only our own process group; the child must not keep editing unattended.
+                    kill_process_tree(process)
+                    if not isinstance(interruption, subprocess.TimeoutExpired):
+                        raise
+                    try:
+                        stdout, stderr = process.communicate(timeout=5)
+                    except subprocess.TimeoutExpired as late:
+                        stdout, stderr = late.stdout, late.stderr
+                    raise subprocess.TimeoutExpired(list(argv), timeout, output=stdout, stderr=stderr) from None
+                completed = subprocess.CompletedProcess(list(argv), process.returncode, stdout, stderr)
         except subprocess.TimeoutExpired as exc:
             raw_stdout = exc.stdout if isinstance(exc.stdout, str) else (exc.stdout.decode("utf-8", errors="replace") if exc.stdout else "")
             raw_stderr = exc.stderr if isinstance(exc.stderr, str) else (exc.stderr.decode("utf-8", errors="replace") if exc.stderr else "")

@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 from pathlib import Path
-import subprocess
 import sys
 import tempfile
 import unittest
@@ -87,10 +86,35 @@ class ProcessReliabilityTests(unittest.TestCase):
         self.assertEqual(json.loads(received), args)
 
     def test_no_shell_true_anywhere(self):
-        with patch("subprocess.run") as mock_run:
-            mock_run.return_value = subprocess.CompletedProcess([], 0, "ok", "")
+        with patch("gauntlet.process.subprocess.Popen") as mock_popen:
+            process = mock_popen.return_value.__enter__.return_value
+            process.communicate.return_value = ("ok", "")
+            process.returncode = 0
             self.runner.run(["echo", "safe"])
-            self.assertFalse(mock_run.call_args.kwargs.get("shell", True))
+            self.assertFalse(mock_popen.call_args.kwargs.get("shell", True))
+
+    def test_timeout_kills_grandchildren_and_returns_promptly(self):
+        import time
+
+        import psutil
+
+        with tempfile.TemporaryDirectory() as tmp:
+            marker = Path(tmp) / "grandchild.pid"
+            script = (
+                "import subprocess,sys,time;"
+                "c=subprocess.Popen([sys.executable,'-c','import time;time.sleep(60)']);"
+                "open(sys.argv[1],'w').write(str(c.pid));time.sleep(60)"
+            )
+            started = time.monotonic()
+            result = self.runner.run([sys.executable, "-c", script, str(marker)], timeout=3)
+            self.assertLess(time.monotonic() - started, 20)
+            self.assertTrue(result.timed_out)
+            grandchild = int(marker.read_text())
+            try:
+                psutil.Process(grandchild).wait(timeout=5)
+            except psutil.NoSuchProcess:
+                pass
+            self.assertFalse(psutil.pid_exists(grandchild) and psutil.Process(grandchild).is_running())
 
     def test_bound_output_helper(self):
         short_text = "hello world"

@@ -30,7 +30,7 @@ def parse_task(text: str) -> TaskContract:
     current: str | None = None
     headings = {"objective", "acceptance criteria", "constraints", "verification"}
     for line in text.splitlines():
-        match = re.fullmatch(r"#\s+(.+?)\s*", line)
+        match = re.fullmatch(r"\s*#\s+(.+?)\s*", line)
         if match:
             candidate = match.group(1).strip().lower()
             current = candidate if candidate in headings else None

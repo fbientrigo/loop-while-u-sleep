@@ -11,7 +11,12 @@ from typing import Sequence
 
 from .config import Config
 from .process import ProcessRunner
+from .providers import resolve_executable
 from .verdict import schema_path
+
+
+# `codex debug models` prints about 600 KB of JSON; the default output cap would cut it in half.
+DOCTOR_OUTPUT_CHARS = 8_000_000
 
 
 @dataclass(frozen=True)
@@ -56,8 +61,8 @@ def doctor(
     agy_command: Sequence[str] | None = None,
     codex_command: Sequence[str] | None = None,
 ) -> DoctorReport:
-    agy_cmd = list(agy_command) if agy_command else [shutil.which("agy") or "agy"]
-    codex_cmd = list(codex_command) if codex_command else [shutil.which("codex") or "codex"]
+    agy_cmd = list(agy_command) if agy_command else [resolve_executable("agy")]
+    codex_cmd = list(codex_command) if codex_command else [resolve_executable("codex")]
 
     git = _version(["git"], runner)
     agy = _version(agy_cmd, runner)
@@ -95,10 +100,14 @@ def doctor(
     except OSError:
         critic_structured_output = False
 
-    if os.name != "posix" or not codex:
-        read_only = "UNPROVEN: requires Debian/Linux Codex sandbox smoke test"
+    if not codex:
+        read_only = "UNPROVEN: codex is not available to run the sandbox smoke test"
     elif not critic_model:
         read_only = "UNPROVEN: no critic.model configured"
+    elif os.name == "nt":
+        # On Windows codex rejects shell commands "by policy" before the sandbox is reached, so an exec-based
+        # write attempt proves nothing. Ask the sandbox itself, with a positive control.
+        read_only = _codex_sandbox_smoke(runner, codex_cmd)
     else:
         read_only = _codex_smoke(runner, critic_model, codex_cmd)
 
@@ -133,8 +142,8 @@ def _version(argv: list[str], runner: ProcessRunner) -> str | None:
 def _capture(runner: ProcessRunner, argv: list[str]) -> str:
     if not argv or not argv[0]:
         return ""
-    result = runner.run(argv)
-    return result.stdout if result.returncode == 0 else f"{result.stdout}\n{result.stderr}"
+    result = runner.run(argv, timeout=120)
+    return f"{result.stdout}\n{result.stderr}"
 
 
 def _agy_model_available(models_text: str, worker_model: str) -> bool:
@@ -177,11 +186,77 @@ def _dir_manifest(root: Path) -> dict[str, str]:
     return manifest
 
 
+def _codex_sandbox_smoke(runner: ProcessRunner, codex_cmd: Sequence[str]) -> str:
+    """Windows read-only proof via `codex sandbox`: a write must succeed under :workspace and fail under :read-only.
+
+    Judged only by exit code and the file system, never by (localized) message text.
+    """
+    codex_cmd = list(codex_cmd)
+    outcomes = {}
+    for profile in (":workspace", ":read-only"):
+        with tempfile.TemporaryDirectory(prefix="gauntlet-codex-sandbox-") as temporary:
+            root = Path(temporary)
+            before = _dir_manifest(root)
+            result = runner.run(
+                [*codex_cmd, "sandbox", "-P", profile, "-C", str(root), "--", "cmd", "/c", "echo forbidden>gauntlet-write-sentinel"],
+                cwd=root,
+                timeout=120,
+            )
+            outcomes[profile] = (result, (root / "gauntlet-write-sentinel").exists(), _dir_manifest(root) != before)
+    control, control_written, _ = outcomes[":workspace"]
+    if control.returncode != 0 or not control_written:
+        return f"UNPROVEN: positive control failed; the sandbox did not allow a write under :workspace (exit {control.returncode})"
+    test, test_written, test_changed = outcomes[":read-only"]
+    if test_written or test_changed:
+        return "UNPROVEN: controlled sandbox write was not blocked; filesystem mutation detected"
+    if test.returncode == 0:
+        return "UNPROVEN: the read-only sandbox command exited 0; a blocked write must fail"
+    return "PROVEN"
+
+
 def _codex_smoke(runner: ProcessRunner, model: str | None, codex_cmd: Sequence[str] | None = None) -> str:
-    codex_cmd = list(codex_cmd) if codex_cmd else [shutil.which("codex") or "codex"]
+    codex_cmd = list(codex_cmd) if codex_cmd else [resolve_executable("codex")]
+    # Positive control first: the same prompt under workspace-write must really create the file. Without it,
+    # a model that simply declines to write would make the read-only run look "blocked".
+    control = _smoke_once(runner, model, codex_cmd, "workspace-write")
+    if control.result.returncode != 0 or not control.sentinel_created:
+        return (
+            "UNPROVEN: positive control failed; Codex did not write the sentinel under workspace-write "
+            f"(exit {control.result.returncode}), so a blocked write under read-only proves nothing"
+        )
+    test = _smoke_once(runner, model, codex_cmd, "read-only")
+    if test.manifest_changed:
+        return "UNPROVEN: controlled Codex write was not blocked; filesystem mutation detected"
+    if test.result.returncode != 0:
+        return f"UNPROVEN: controlled Codex command failed with exit code {test.result.returncode}"
+    if test.sentinel_created:
+        return "UNPROVEN: controlled Codex write was not blocked; sentinel was created"
+    output_lower = f"{test.result.stdout}\n{test.result.stderr}".lower()
+    # Only real operating-system errors count; the model's own prose (e.g. "blocked") proves nothing.
+    denial_signals = (
+        "read-only file system",
+        "permission denied",
+        "operation not permitted",
+        "eacces",
+        "erofs",
+        "access is denied",  # Windows
+        "unauthorizedaccess",  # Windows PowerShell
+    )
+    if not any(signal in output_lower for signal in denial_signals):
+        return "UNPROVEN: no explicit write-denial error (e.g. 'Read-only file system', 'Permission denied') was observed"
+    return "PROVEN"
+
+
+@dataclass(frozen=True)
+class _SmokeRun:
+    result: object
+    sentinel_created: bool
+    manifest_changed: bool
+
+
+def _smoke_once(runner: ProcessRunner, model: str | None, codex_cmd: Sequence[str], sandbox: str) -> _SmokeRun:
     with tempfile.TemporaryDirectory(prefix="gauntlet-codex-smoke-") as temporary:
         root = Path(temporary)
-        sentinel = root / "gauntlet-write-sentinel"
         manifest_before = _dir_manifest(root)
         argv = [
             *codex_cmd,
@@ -191,7 +266,7 @@ def _codex_smoke(runner: ProcessRunner, model: str | None, codex_cmd: Sequence[s
             "-C",
             str(root),
             "-s",
-            "read-only",
+            sandbox,
             "--ephemeral",
             "--ignore-user-config",
             "--ignore-rules",
@@ -202,17 +277,13 @@ def _codex_smoke(runner: ProcessRunner, model: str | None, codex_cmd: Sequence[s
         if model:
             argv.extend(["-m", model])
         argv.append("-")
-        prompt = "Attempt exactly: printf forbidden > gauntlet-write-sentinel. Report whether the sandbox blocked it."
+        prompt = (
+            "Create a file named gauntlet-write-sentinel in the current directory containing the word forbidden. "
+            "Run a shell command to do it; use whatever command works on this system. Then print the exact error, if any."
+        )
         result = runner.run(argv, cwd=root, input_text=prompt)
-        manifest_after = _dir_manifest(root)
-        if manifest_before != manifest_after:
-            return "UNPROVEN: controlled Codex write was not blocked; filesystem mutation detected"
-        if result.returncode != 0:
-            return f"UNPROVEN: controlled Codex command failed with exit code {result.returncode}"
-        if sentinel.exists():
-            return "UNPROVEN: controlled Codex write was not blocked; sentinel was created"
-        output_lower = f"{result.stdout}\n{result.stderr}".lower()
-        denial_signals = ("read-only file system", "permission denied", "operation not permitted", "eacces", "erofs")
-        if not any(signal in output_lower for signal in denial_signals):
-            return "UNPROVEN: no explicit write-denial error (e.g. 'Read-only file system', 'Permission denied') was observed"
-        return "PROVEN"
+        return _SmokeRun(
+            result,
+            (root / "gauntlet-write-sentinel").exists(),
+            _dir_manifest(root) != manifest_before,
+        )

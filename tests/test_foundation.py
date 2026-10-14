@@ -36,9 +36,29 @@ class FakeRunner:
         self.result = result
         self.calls: list[tuple[tuple[str, ...], Path | None, str | None]] = []
 
-    def run(self, argv, *, cwd=None, input_text=None):
+    def run(self, argv, *, cwd=None, input_text=None, timeout=None):
         self.calls.append((tuple(argv), cwd, input_text))
         return self.result
+
+
+class SandboxRunner:
+    """Fake codex: writes the sentinel under workspace-write (positive control); read-only behaviour is injected."""
+
+    def __init__(self, read_only_result: ProcessResult, *, control_writes: bool = True, on_read_only=None):
+        self.read_only_result = read_only_result
+        self.control_writes = control_writes
+        self.on_read_only = on_read_only
+        self.calls: list[tuple] = []
+
+    def run(self, argv, *, cwd=None, input_text=None, **kwargs):
+        self.calls.append((tuple(argv), cwd, input_text))
+        if "workspace-write" in argv:
+            if self.control_writes:
+                (Path(cwd) / "gauntlet-write-sentinel").write_text("forbidden")
+            return ProcessResult(0, "done", "")
+        if self.on_read_only:
+            self.on_read_only(Path(cwd))
+        return self.read_only_result
 
 
 class FoundationTests(unittest.TestCase):
@@ -106,9 +126,12 @@ class FoundationTests(unittest.TestCase):
         result = run_commands((command,), Path.cwd(), runner)
         self.assertEqual(runner.calls[0][0], command.argv)
         self.assertEqual(result[0].argv, command.argv)
-        with patch("gauntlet.process.subprocess.run", return_value=subprocess.CompletedProcess([], 0, "", "")) as run:
+        with patch("gauntlet.process.subprocess.Popen") as popen:
+            process = popen.return_value.__enter__.return_value
+            process.communicate.return_value = ("", "")
+            process.returncode = 0
             SubprocessRunner().run(["echo", "safe"])
-        self.assertFalse(run.call_args.kwargs["shell"])
+        self.assertFalse(popen.call_args.kwargs["shell"])
 
     def test_missing_executable_is_a_nonzero_result(self):
         result = SubprocessRunner().run(["gauntlet-command-that-does-not-exist"])
@@ -171,21 +194,79 @@ class FoundationTests(unittest.TestCase):
         from gauntlet.doctor import _codex_smoke
 
         # Output without denial signal fails (e.g. model declined or did nothing)
-        runner_no_denial = FakeRunner(ProcessResult(0, "I did not run the write command", ""))
-        self.assertIn("UNPROVEN", _codex_smoke(runner_no_denial, "model"))
+        no_denial = SandboxRunner(ProcessResult(0, "I did not run the write command", ""))
+        self.assertIn("UNPROVEN", _codex_smoke(no_denial, "model"))
 
-        # Sentinel created fails even if words appear
-        class CreateSentinelRunner:
+        # Sentinel created under read-only fails even if denial words appear
+        def create(cwd):
+            (cwd / "gauntlet-write-sentinel").write_text("forbidden")
+
+        created = SandboxRunner(ProcessResult(0, "permission denied", ""), on_read_only=create)
+        self.assertIn("UNPROVEN", _codex_smoke(created, "model"))
+
+        # Output with denial signal, no sentinel, and a working positive control proves read-only
+        proven = SandboxRunner(ProcessResult(0, "tool error: Read-only file system", ""))
+        self.assertEqual(_codex_smoke(proven, "model"), "PROVEN")
+
+    def test_codex_smoke_is_not_proven_by_a_model_that_only_claims_the_sandbox_blocked_it(self):
+        from gauntlet.doctor import _codex_smoke
+
+        # The model never wrote anything, even under workspace-write, and just says it was blocked.
+        declined = SandboxRunner(
+            ProcessResult(0, "I couldn't create it; it was blocked by the sandbox. Access is denied.", ""),
+            control_writes=False,
+        )
+        verdict = _codex_smoke(declined, "model")
+        self.assertIn("UNPROVEN", verdict)
+        self.assertIn("positive control", verdict)
+        # and the prose-only phrase alone is not an accepted denial signal on a working control
+        prose = SandboxRunner(ProcessResult(0, "it was blocked by the sandbox", ""))
+        self.assertIn("UNPROVEN", _codex_smoke(prose, "model"))
+
+    def test_codex_smoke_accepts_windows_denial_text(self):
+        from gauntlet.doctor import _codex_smoke
+
+        windows_denied = SandboxRunner(ProcessResult(0, "Set-Content : Access is denied to the path", ""))
+        self.assertEqual(_codex_smoke(windows_denied, "model"), "PROVEN")
+        self.assertNotIn("printf", windows_denied.calls[0][2])  # the prompt must not assume a POSIX shell
+
+    def test_windows_sandbox_smoke_needs_a_working_control_and_a_failing_read_only_write(self):
+        from gauntlet.doctor import _codex_sandbox_smoke
+
+        class Sandbox:
+            def __init__(self, workspace_writes=True, read_only_writes=False, read_only_code=1, workspace_code=0):
+                self.cfg = (workspace_writes, read_only_writes, read_only_code, workspace_code)
+
             def run(self, argv, *, cwd=None, input_text=None, **kwargs):
-                if cwd:
+                workspace_writes, read_only_writes, read_only_code, workspace_code = self.cfg
+                profile = argv[argv.index("-P") + 1]
+                writes = workspace_writes if profile == ":workspace" else read_only_writes
+                if writes:
                     (Path(cwd) / "gauntlet-write-sentinel").write_text("forbidden")
-                return ProcessResult(0, "permission denied", "")
+                return ProcessResult(workspace_code if profile == ":workspace" else read_only_code, "", "")
 
-        self.assertIn("UNPROVEN", _codex_smoke(CreateSentinelRunner(), "model"))
+        cmd = ["codex"]
+        self.assertEqual(_codex_sandbox_smoke(Sandbox(), cmd), "PROVEN")
+        self.assertIn("positive control", _codex_sandbox_smoke(Sandbox(workspace_writes=False), cmd))
+        self.assertIn("positive control", _codex_sandbox_smoke(Sandbox(workspace_code=1), cmd))
+        self.assertIn("not blocked", _codex_sandbox_smoke(Sandbox(read_only_writes=True), cmd))
+        self.assertIn("exited 0", _codex_sandbox_smoke(Sandbox(read_only_code=0), cmd))
 
-        # Output with denial signal and no sentinel created proves read-only
-        runner_proven = FakeRunner(ProcessResult(0, "tool error: Read-only file system", ""))
-        self.assertEqual(_codex_smoke(runner_proven, "model"), "PROVEN")
+    def test_critic_schema_lists_every_property_as_required(self):
+        # OpenAI strict structured output rejects a schema whose `required` omits any property (HTTP 400).
+        from gauntlet.verdict import schema_path
+
+        def walk(node):
+            if isinstance(node, dict):
+                if node.get("type") == "object":
+                    self.assertEqual(set(node.get("required", [])), set(node.get("properties", {})))
+                for value in node.values():
+                    walk(value)
+            elif isinstance(node, list):
+                for value in node:
+                    walk(value)
+
+        walk(json.loads(schema_path().read_text(encoding="utf-8")))
 
     def test_run_refuses_short_or_invalid_contract_before_worker(self):
         self.assertEqual(main(["run", "do a thing"]), 2)
@@ -262,7 +343,6 @@ class FoundationTests(unittest.TestCase):
             missing_exe = str(root / "no-such-provider-executable")
             with (
                 patch("gauntlet.cli.Path.cwd", return_value=root),
-                patch("gauntlet.cli.shutil.which", return_value=missing_exe),
                 patch("gauntlet.doctor.shutil.which", return_value=missing_exe),
             ):
                 self.assertEqual(main(["resume", run_id]), 2)
@@ -327,13 +407,10 @@ class FoundationTests(unittest.TestCase):
     def test_doctor_rejects_smoke_test_filesystem_mutation(self):
         from gauntlet.doctor import _codex_smoke
 
-        def mutate_smoke(argv, *, cwd=None, input_text=None):
-            if cwd:
-                (cwd / "unauthorized_file.txt").write_text("injected")
-            return ProcessResult(0, "permission denied: read-only file system", "")
+        def mutate(cwd):
+            (cwd / "unauthorized_file.txt").write_text("injected")
 
-        runner = FakeRunner()
-        runner.run = mutate_smoke
+        runner = SandboxRunner(ProcessResult(0, "permission denied: read-only file system", ""), on_read_only=mutate)
         result = _codex_smoke(runner, "model")
         self.assertIn("filesystem mutation detected", result)
 

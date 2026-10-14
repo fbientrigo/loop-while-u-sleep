@@ -8,6 +8,8 @@ import re
 import tempfile
 import uuid
 
+from .fsutil import replace_with_retry
+
 
 class StoreError(ValueError):
     pass
@@ -50,6 +52,10 @@ class RunStore:
         self._write("status.json", _json(self.status()), overwrite=True)
         return record
 
+    def write_json(self, name: str, value: object) -> None:
+        """Atomically (re)write a derived artifact; frozen evidence must use freeze_json instead."""
+        self._write(name, _json(value), overwrite=True)
+
     def events(self) -> list[dict]:
         path = self.root / "events.jsonl"
         if not path.exists():
@@ -73,7 +79,7 @@ class RunStore:
                 handle.write(data)
                 handle.flush()
                 os.fsync(handle.fileno())
-            os.replace(temporary, target)
+            replace_with_retry(temporary, target)
         finally:
             if os.path.exists(temporary):
                 os.unlink(temporary)

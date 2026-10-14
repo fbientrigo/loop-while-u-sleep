@@ -866,6 +866,132 @@ sys.exit(0 if pathlib.Path('fixed.txt').exists() else 1)
         self.assertNotIn("DONE", [e["status"] for e in store.events()])
         self.assertEqual(len(worker.invocations), 0)
 
+    def test_summary_and_per_turn_changes_record_what_the_worker_created(self):
+        store, worktree, config = self._setup_run()
+        worker = FakeWorkerAdapter([WorkerAction(edits={"feature.txt": "implemented"}, output="created feature.txt")])
+        final_status = Supervisor(store, config, self.task, worktree, self.runner, worker, FakeCriticAdapter.passing()).run()
+        self.assertEqual(final_status["status"], "DONE")
+        changes = json.loads((store.root / "worker-turn-1-changes.json").read_text(encoding="utf-8"))
+        self.assertEqual(list(changes["added"]), ["feature.txt"])
+        self.assertEqual(len(changes["added"]["feature.txt"]), 64)  # sha256 of the created file
+        self.assertEqual(changes["modified"], {})
+        self.assertTrue((store.root / "worker-turn-1-diff.patch").exists())
+        summary = json.loads((store.root / "summary.json").read_text(encoding="utf-8"))
+        self.assertEqual(summary["status"], "DONE")
+        self.assertEqual(summary["turns"][0]["files_added"], ["feature.txt"])
+        self.assertEqual(summary["turns"][0]["critic_verdict"], "PASS")
+        self.assertEqual(summary["turns"][0]["worker_launches"], 1)
+
+    def test_summary_is_written_for_blocked_runs_too(self):
+        store, worktree, config = self._setup_run(
+            verification_commands=(VerificationCommand("fail", (sys.executable, "-c", "import sys; sys.exit(3)")),)
+        )
+        worker = FakeWorkerAdapter([WorkerAction(output="never launched")])
+        final_status = Supervisor(store, config, self.task, worktree, self.runner, worker, FakeCriticAdapter.passing()).run()
+        self.assertEqual(final_status["status"], "BLOCKED")
+        summary = json.loads((store.root / "summary.json").read_text(encoding="utf-8"))
+        self.assertEqual(summary["status"], "BLOCKED")
+        self.assertEqual(summary["turns"], [])
+
+    def test_idle_time_before_resume_does_not_use_the_wall_time_budget(self):
+        from gauntlet.supervisor import active_seconds
+
+        events = [
+            {"kind": "CREATED", "at": "2026-01-01T00:00:00+00:00"},
+            {"kind": "WORKTREE_CREATED", "at": "2026-01-01T00:00:05+00:00"},
+            {"kind": "RUN_RESUMED", "at": "2026-01-02T10:00:00+00:00"},
+            {"kind": "BASELINE_CHECKS_PASSED", "at": "2026-01-02T10:00:30+00:00"},
+            {"kind": "WORKER_STARTED", "at": "2026-01-02T10:01:00+00:00"},
+            {"kind": "RUN_RESUMED", "at": "2026-01-05T10:00:00+00:00"},
+            {"kind": "WORKER_STARTED", "at": "2026-01-05T10:00:10+00:00"},
+        ]
+        self.assertEqual(active_seconds(events), 5 + 30 + 30 + 10)
+
+    def test_crashed_session_is_charged_up_to_its_last_heartbeat(self):
+        from datetime import datetime, timedelta, timezone
+
+        from gauntlet.supervisor import active_seconds, crash_charge_seconds
+
+        store, _worktree, _config = self._setup_run()
+        now = datetime.now(timezone.utc)
+        store.event("WORKER_STARTED", status="RUNNING", detail={"turn": 1})
+        events = store.events()
+        events[-1]["at"] = (now - timedelta(seconds=1000)).isoformat()
+        (store.root / "events.jsonl").write_text("".join(json.dumps(e, sort_keys=True) + "\n" for e in events), encoding="utf-8")
+        self.assertEqual(crash_charge_seconds(store), 0.0)  # no heartbeat file: nothing to charge
+        (store.root / "alive.json").write_text(json.dumps({"at": (now - timedelta(seconds=900)).isoformat()}), encoding="utf-8")
+        self.assertAlmostEqual(crash_charge_seconds(store), 100.0, delta=0.5)
+        charged = crash_charge_seconds(store)
+        events = [
+            {"kind": "CREATED", "at": "2026-01-01T00:00:00+00:00"},
+            {"kind": "WORKER_STARTED", "at": "2026-01-01T00:00:10+00:00"},
+            {"kind": "RUN_RESUMED", "at": "2026-01-09T00:00:00+00:00", "detail": {"charged_seconds": charged}},
+            {"kind": "WORKER_STARTED", "at": "2026-01-09T00:00:05+00:00"},
+        ]
+        self.assertAlmostEqual(active_seconds(events), 10 + charged + 5, delta=0.01)
+        self.assertLess(active_seconds(events), 200)  # the 8 idle days are not charged
+
+    def test_heartbeat_runs_during_a_run_and_is_removed_on_clean_exit(self):
+        from gauntlet.supervisor import Heartbeat
+
+        store, _worktree, _config = self._setup_run()
+        with Heartbeat(store, interval=0.05):
+            for _ in range(100):
+                if (store.root / "alive.json").exists():
+                    break
+                import time
+
+                time.sleep(0.05)
+            self.assertTrue((store.root / "alive.json").exists())
+        self.assertFalse((store.root / "alive.json").exists())
+        store2, worktree, config = self._setup_run()
+        worker = FakeWorkerAdapter([WorkerAction(edits={"feature.txt": "implemented"}, output="ok")])
+        Supervisor(store2, config, self.task, worktree, self.runner, worker, FakeCriticAdapter.passing()).run()
+        self.assertFalse((store2.root / "alive.json").exists())
+
+    def test_worker_editing_a_protected_evaluator_file_is_blocked(self):
+        import dataclasses
+
+        store, worktree, config = self._setup_run()
+        config = dataclasses.replace(config, protected=("eval_*.py",))
+        (worktree / "eval_score.py").write_text("assert True\n", encoding="utf-8")
+        worker = FakeWorkerAdapter([WorkerAction(edits={"eval_score.py": "pass\n", "feature.txt": "x"})])
+        critic = FakeCriticAdapter.passing()
+        final = Supervisor(store, config, self.task, worktree, self.runner, worker, critic).run()
+        self.assertEqual(final["status"], "BLOCKED")
+        self.assertEqual(final["last_event"], "EVALUATOR_TAMPERED")
+        self.assertEqual(store.events()[-1]["detail"]["changed"], ["eval_score.py"])
+        self.assertEqual(len(critic.invocations), 0)
+
+    def test_completion_gate_refuses_done_without_matching_evidence(self):
+        store, worktree, config = self._setup_run()
+        supervisor = Supervisor(store, config, self.task, worktree, self.runner, FakeWorkerAdapter([]), FakeCriticAdapter.passing())
+        status = supervisor._complete_supervisor_gate(1)
+        self.assertEqual(status["status"], "ESCALATED")
+        self.assertEqual(status["last_event"], "COMPLETION_GATE_REFUSED")
+        store.freeze_json("critic-turn-2-verdict.json", {"verdict": "BLOCK", "blocking_findings": [{"id": "x"}]})
+        store.freeze_json("verification-final-turn-2.json", [])
+        self.assertEqual(supervisor._complete_supervisor_gate(2)["status"], "ESCALATED")
+        store.freeze_json("critic-turn-3-verdict.json", {"verdict": "PASS", "blocking_findings": []})
+        store.freeze_json("verification-final-turn-3.json", [{"name": "t", "argv": ["x"], "returncode": 1}])
+        self.assertEqual(supervisor._complete_supervisor_gate(3)["status"], "ESCALATED")
+        self.assertNotIn("DONE", [e["status"] for e in store.events()])
+
+    def test_adapter_time_is_capped_at_the_remaining_wall_time(self):
+        from gauntlet.supervisor import grant_time
+
+        class Adapter:
+            timeout_seconds = 14400.0
+
+        adapter = Adapter()
+        grant_time(adapter, 90.0)
+        self.assertEqual(adapter.timeout_seconds, 90.0)
+        grant_time(adapter, 99999.0)
+        self.assertEqual(adapter.timeout_seconds, 14400.0)
+        grant_time(adapter, 0.2)
+        self.assertEqual(adapter.timeout_seconds, 1.0)
+        grant_time(object(), 5.0)  # adapters without a timeout (fakes) are left alone
+
     def test_resume_worker_output_without_result_fails_closed(self):
         """If worker output exists without a recorded exit result, resume must fail closed rather than inferring success."""
         store, worktree, config = self._setup_run()
@@ -880,8 +1006,8 @@ sys.exit(0 if pathlib.Path('fixed.txt').exists() else 1)
         resumed = Supervisor.from_store(store, worktree, self.runner, worker, critic)
         final_status = resumed.run()
 
-        self.assertEqual(final_status["status"], "BLOCKED")
-        self.assertEqual(final_status["last_event"], "WORKER_FAILED")
+        self.assertEqual(final_status["status"], "ESCALATED")
+        self.assertEqual(final_status["last_event"], "WORKER_EXECUTION_UNKNOWN")
         self.assertNotIn("DONE", [e["status"] for e in store.events()])
         self.assertEqual(len(worker.invocations), 0)
 
