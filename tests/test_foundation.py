@@ -36,7 +36,7 @@ class FakeRunner:
         self.result = result
         self.calls: list[tuple[tuple[str, ...], Path | None, str | None]] = []
 
-    def run(self, argv, *, cwd=None, input_text=None):
+    def run(self, argv, *, cwd=None, input_text=None, timeout=None):
         self.calls.append((tuple(argv), cwd, input_text))
         return self.result
 
