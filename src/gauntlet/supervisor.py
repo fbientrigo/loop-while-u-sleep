@@ -4,7 +4,9 @@ from dataclasses import asdict
 from datetime import datetime
 import hashlib
 import json
+import os
 from pathlib import Path
+import threading
 import time
 from typing import Any, Callable
 
@@ -35,6 +37,95 @@ class FoundationSupervisor:
         verdict = validate_verdict(raw_verdict)
         self.store.freeze_json("critic-verdict.json", verdict)
         self.store.event("CRITIC_RECORDED", status="CRITIC_RECORDED", detail={"verdict": verdict["verdict"]})
+
+
+HEARTBEAT_SECONDS = 15.0
+HEARTBEAT_FILE = "alive.json"
+
+
+class Heartbeat:
+    """Writes alive.json while a run executes, so work lost to a crash can be charged on resume.
+
+    A clean exit removes the file; only a crash leaves it behind.
+    """
+
+    def __init__(self, store: RunStore, interval: float = HEARTBEAT_SECONDS):
+        self.store = store
+        self.interval = interval
+        self._stop = threading.Event()
+        self._thread = threading.Thread(target=self._loop, name="gauntlet-heartbeat", daemon=True)
+
+    def _beat(self) -> None:
+        try:
+            self.store.write_json(HEARTBEAT_FILE, {"at": datetime.now().astimezone().isoformat(), "pid": os.getpid()})
+        except OSError:
+            pass  # a missed beat only makes the crash charge smaller
+
+    def _loop(self) -> None:
+        self._beat()
+        while not self._stop.wait(self.interval):
+            self._beat()
+
+    def __enter__(self) -> "Heartbeat":
+        self._thread.start()
+        return self
+
+    def __exit__(self, *_exc) -> None:
+        self._stop.set()
+        self._thread.join(timeout=5)
+        try:
+            (self.store.root / HEARTBEAT_FILE).unlink()
+        except OSError:
+            pass
+
+
+def crash_charge_seconds(store: RunStore) -> float:
+    """Seconds of work a crashed session did after its last event, from its last heartbeat.
+
+    Zero when there is no heartbeat file (the previous session ended cleanly, or predates heartbeats).
+    The error is at most one heartbeat interval.
+    """
+    try:
+        alive = json.loads((store.root / HEARTBEAT_FILE).read_text(encoding="utf-8"))
+        alive_at = datetime.fromisoformat(alive["at"]).timestamp()
+        events = store.events()
+        last_at = datetime.fromisoformat(events[-1]["at"]).timestamp()
+    except (OSError, ValueError, KeyError, TypeError, IndexError):
+        return 0.0
+    return round(max(0.0, min(alive_at - last_at, time.time() - last_at)), 1)
+
+
+def active_seconds(events: list[dict[str, Any]]) -> float:
+    """Wall time the run was actually being worked on.
+
+    The gap before a RUN_RESUMED event is idle time (the machine was off, or nobody had resumed yet)
+    and must not use up the wall-time budget. Only the part a crashed session provably worked
+    (detail.charged_seconds, taken from its heartbeat) is charged.
+    """
+    total = 0.0
+    for previous, current in zip(events, events[1:]):
+        if current.get("kind") == "RUN_RESUMED":
+            try:
+                total += max(0.0, float(current.get("detail", {}).get("charged_seconds", 0)))
+            except (TypeError, ValueError):
+                pass
+            continue
+        try:
+            gap = datetime.fromisoformat(current["at"]).timestamp() - datetime.fromisoformat(previous["at"]).timestamp()
+        except (KeyError, ValueError, TypeError):
+            continue
+        total += max(0.0, gap)
+    return total
+
+
+def grant_time(adapter: Any, remaining: float) -> None:
+    """Cap an adapter's per-call timeout at the wall time that is still left (never below one second)."""
+    if not hasattr(adapter, "timeout_seconds"):
+        return
+    base = getattr(adapter, "_base_timeout_seconds", adapter.timeout_seconds)
+    adapter._base_timeout_seconds = base
+    allowance = max(1.0, remaining)
+    adapter.timeout_seconds = allowance if not base else min(base, allowance)
 
 
 def compute_fingerprint(finding: dict[str, Any]) -> str:
@@ -216,6 +307,16 @@ class Supervisor:
 
     def run(self) -> dict[str, Any]:
         """Execute the supervisor state machine until a terminal state is reached."""
+        try:
+            with Heartbeat(self.store):
+                return self._run()
+        finally:
+            try:
+                self._write_summary()
+            except Exception:  # the summary describes the run; it must never change its outcome
+                pass
+
+    def _run(self) -> dict[str, Any]:
         status = self.store.status()
         current_status = status.get("status")
         if current_status in {"DONE", "BLOCKED", "ESCALATED"}:
@@ -227,14 +328,7 @@ class Supervisor:
         events = self.store.events()
         event_kinds = [e["kind"] for e in events]
 
-        recorded_elapsed = 0.0
-        if len(events) >= 2:
-            try:
-                t0 = datetime.fromisoformat(events[0]["at"]).timestamp()
-                t1 = datetime.fromisoformat(events[-1]["at"]).timestamp()
-                recorded_elapsed = max(0.0, t1 - t0)
-            except Exception:
-                pass
+        recorded_elapsed = active_seconds(events)
         start_clock = self.clock()
 
         # Check wall-time deadline before baseline checks
@@ -365,20 +459,12 @@ class Supervisor:
                         error=err_text,
                         timed_out=bool(result_data.get("timed_out", False)),
                     )
-                elif output_file.exists():
-                    # Output file exists without recorded exit status: fail closed
-                    self.store.event(
-                        "WORKER_FAILED",
-                        status="BLOCKED",
-                        detail={"turn": turn, "reason": "unrecorded_worker_exit_status"},
-                    )
-                    return self.store.status()
-                elif any(
-                    e["kind"] == "WORKER_STARTED" and e.get("detail", {}).get("turn") == turn
-                    for e in self.store.events()
+                elif output_file.exists() or any(
+                    e["kind"] == "WORKER_STARTED" and e.get("detail", {}).get("turn") == turn for e in self.store.events()
                 ):
                     # The former process may have changed the worktree or reached external tools.
                     # A missing durable result is UNKNOWN, not permission to launch it again.
+                    # Only `gauntlet reconcile` (operator decision) can move this run forward.
                     self.store.event(
                         "WORKER_EXECUTION_UNKNOWN",
                         status="ESCALATED",
@@ -386,7 +472,10 @@ class Supervisor:
                     )
                     return self.store.status()
                 else:
+                    self._freeze_manifest_before_worker(turn)
                     self.store.event("WORKER_STARTED", status="RUNNING", detail={"turn": turn})
+                    elapsed = recorded_elapsed + (self.clock() - start_clock)
+                    grant_time(self.worker, self.config.limits.wall_time_seconds - elapsed)
 
                     worker_result = self.worker.run(
                         worktree=self.worktree,
@@ -407,6 +496,8 @@ class Supervisor:
 
                     if not self._check_frozen_artifacts():
                         return self.store.status()
+
+                self._record_worker_changes(turn)
 
                 # Check wall-time deadline immediately after worker execution
                 elapsed = recorded_elapsed + (self.clock() - start_clock)
@@ -532,6 +623,8 @@ class Supervisor:
                         )
                         return self.store.status()
                 else:
+                    elapsed = recorded_elapsed + (self.clock() - start_clock)
+                    grant_time(self.critic, self.config.limits.wall_time_seconds - elapsed)
                     critic_result = self.critic.run(
                         worktree=self.worktree,
                         task=self.task,
@@ -773,12 +866,108 @@ class Supervisor:
             self.store.event("BASELINE_CHECKS_PASSED", status="RUNNING")
         return True
 
+    def _gate_problem(self, turn: int) -> str | None:
+        """Re-read the evidence on disk; DONE is refused unless it still shows PASS and green final checks."""
+        verdict_file = self.store.root / f"critic-turn-{turn}-verdict.json"
+        final_file = self.store.root / f"verification-final-turn-{turn}.json"
+        try:
+            verdict = json.loads(verdict_file.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            return "critic verdict evidence is missing or unreadable"
+        if verdict.get("verdict") != "PASS" or verdict.get("blocking_findings"):
+            return "recorded critic verdict is not an empty-finding PASS"
+        try:
+            finals = json.loads(final_file.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            return "final check evidence is missing or unreadable"
+        if not isinstance(finals, list) or any(not isinstance(r, dict) or r.get("returncode") != 0 for r in finals):
+            return "recorded final checks did not all pass"
+        return None
+
+    def _freeze_manifest_before_worker(self, turn: int) -> None:
+        name = f"worker-turn-{turn}-manifest-before.json"
+        if not (self.store.root / name).exists():
+            self.store.freeze_json(name, snapshot_manifest(self.worktree))
+
+    def _record_worker_changes(self, turn: int) -> None:
+        """Freeze what a worker turn changed: file lists with hashes, plus the Git patch against HEAD."""
+        changes_name = f"worker-turn-{turn}-changes.json"
+        before_file = self.store.root / f"worker-turn-{turn}-manifest-before.json"
+        if (self.store.root / changes_name).exists() or not before_file.exists():
+            return
+        before = json.loads(before_file.read_text(encoding="utf-8"))
+        after = snapshot_manifest(self.worktree)
+        diff = manifest_diff(before, after)
+
+        def visible(paths: list[str]) -> list[str]:
+            return [p for p in paths if not p.startswith(".git-")]
+
+        record: dict[str, Any] = {
+            "turn": turn,
+            "added": {p: after[p] for p in visible(diff["added"])},
+            "modified": {p: after[p] for p in visible(diff["modified"])},
+            "removed": visible(diff["removed"]),
+            "patch": None,
+        }
+        try:
+            patch = self.runner.run(["git", "--no-optional-locks", "diff", "--binary", "HEAD"], cwd=self.worktree, timeout=60)
+            if patch.returncode == 0 and isinstance(patch.stdout, str):
+                self.store.freeze_text(f"worker-turn-{turn}-diff.patch", patch.stdout)
+                record["patch"] = f"worker-turn-{turn}-diff.patch"
+                record["patch_truncated"] = "[truncated" in patch.stdout
+        except Exception:  # evidence is best effort; the manifest lists above are the authority
+            pass
+        self.store.freeze_json(changes_name, record)
+
+    def _write_summary(self) -> None:
+        """One-file answer to 'did the job run and what did it create?', rewritten whenever a run stops."""
+        events = self.store.events()
+        status = self.store.status()
+        turns = []
+        for turn in sorted({e.get("detail", {}).get("turn") for e in events if isinstance(e.get("detail", {}).get("turn"), int)}):
+            changes_file = self.store.root / f"worker-turn-{turn}-changes.json"
+            changes = json.loads(changes_file.read_text(encoding="utf-8")) if changes_file.exists() else None
+            verdict_file = self.store.root / f"critic-turn-{turn}-verdict.json"
+            verdict = json.loads(verdict_file.read_text(encoding="utf-8")) if verdict_file.exists() else None
+            turns.append(
+                {
+                    "turn": turn,
+                    "worker_launches": sum(1 for e in events if e["kind"] == "WORKER_STARTED" and e.get("detail", {}).get("turn") == turn),
+                    "worker_finished": any(e["kind"] == "WORKER_FINISHED" and e.get("detail", {}).get("turn") == turn for e in events),
+                    "files_added": sorted(changes["added"]) if changes else None,
+                    "files_modified": sorted(changes["modified"]) if changes else None,
+                    "files_removed": changes["removed"] if changes else None,
+                    "patch": changes.get("patch") if changes else None,
+                    "critic_verdict": verdict["verdict"] if verdict else None,
+                    "critic_findings": len(verdict["blocking_findings"]) if verdict else None,
+                }
+            )
+        summary = {
+            "run_id": self.store.run_id,
+            "status": status.get("status"),
+            "last_event": status.get("last_event"),
+            "created_at": events[0]["at"] if events else None,
+            "last_event_at": events[-1]["at"] if events else None,
+            "active_seconds": round(active_seconds(events), 1),
+            "worktree": str(self.worktree),
+            "turns": turns,
+        }
+        self.store.write_json("summary.json", summary)
+
     def _complete_supervisor_gate(self, turn: int) -> dict[str, Any]:
         """CONSTITUTIONAL PROPERTY: The only place where terminal DONE is created."""
+        problem = self._gate_problem(turn)
+        if problem:
+            self.store.event(
+                "COMPLETION_GATE_REFUSED",
+                status="ESCALATED",
+                detail={"turn": turn, "reason": problem},
+            )
+            return self.store.status()
         output_file = self.store.root / f"worker-turn-{turn}-output.txt"
         output = output_file.read_text(encoding="utf-8") if output_file.exists() else ""
         verdict_file = self.store.root / f"critic-turn-{turn}-verdict.json"
-        verdict = json.loads(verdict_file.read_text(encoding="utf-8")) if verdict_file.exists() else {}
+        verdict = json.loads(verdict_file.read_text(encoding="utf-8"))
 
         if not (self.store.root / "worker-output.txt").exists():
             self.store.freeze_text("worker-output.txt", output)

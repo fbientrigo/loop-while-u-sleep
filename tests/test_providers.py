@@ -8,7 +8,7 @@ import sys
 import tempfile
 import unittest
 
-from gauntlet.config import parse_config
+from gauntlet.config import Config, parse_config
 from gauntlet.doctor import doctor
 from gauntlet.process import SubprocessRunner
 from gauntlet.providers import (
@@ -669,6 +669,41 @@ class ProvidersDoctorTests(unittest.TestCase):
             self.assertFalse(report.safe)
         else:
             self.skipTest("posix platform: read-only smoke test path differs")
+
+
+class ResolveExecutableTests(unittest.TestCase):
+    def test_npm_cmd_shim_resolves_to_the_native_exe_next_to_it(self) -> None:
+        import tempfile
+
+        from gauntlet.providers import resolve_executable
+
+        with tempfile.TemporaryDirectory() as raw:
+            npm = Path(raw)
+            shim = npm / "codex.cmd"
+            shim.write_text("@echo off")
+            native = npm / "node_modules/@openai/codex/node_modules/@openai/codex-win32-x64/vendor/x86_64-pc-windows-msvc/bin/codex.exe"
+            native.parent.mkdir(parents=True)
+            native.write_text("binary")
+            self.assertEqual(resolve_executable("codex", lambda _name: str(shim)), str(native))
+
+    def test_shim_without_a_native_exe_is_returned_so_it_is_still_refused(self) -> None:
+        import tempfile
+
+        from gauntlet.providers import AdapterError, CodexAdapter, resolve_executable
+
+        with tempfile.TemporaryDirectory() as raw:
+            shim = Path(raw) / "codex.cmd"
+            shim.write_text("@echo off")
+            found = resolve_executable("codex", lambda _name: str(shim))
+            self.assertEqual(found, str(shim))
+            with self.assertRaises(AdapterError):
+                CodexAdapter(store=None, runner=None, config=Config("fake", "m", ()), command=(found,))
+
+    def test_plain_exe_and_missing_tool_pass_through(self) -> None:
+        from gauntlet.providers import resolve_executable
+
+        self.assertEqual(resolve_executable("agy", lambda _name: r"C:\bin\agy.exe"), r"C:\bin\agy.exe")
+        self.assertEqual(resolve_executable("agy", lambda _name: None), "agy")
 
 
 if __name__ == "__main__":

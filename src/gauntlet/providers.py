@@ -239,6 +239,30 @@ def _reject_shell_executable(executable: str) -> None:
         )
 
 
+def resolve_executable(name: str, which: Callable[[str], str | None] | None = None) -> str:
+    """Find the program to launch for a provider CLI.
+
+    npm installs Windows CLIs as .cmd shims, which Gauntlet refuses to launch (they run through cmd.exe).
+    The shim only starts a native .exe that sits in its node_modules, so return that exe instead.
+    Anything else is returned as found; a shim with no native exe next to it is still refused later.
+    """
+    found = (which or shutil.which)(name)
+    if not found:
+        return name
+    if not found.lower().endswith(_DISALLOWED_EXEC_SUFFIXES):
+        return found
+    base = Path(found).parent / "node_modules" / "@openai"
+    patterns = (
+        f"{name}/node_modules/@openai/{name}-*/vendor/*/bin/{name}.exe",
+        f"{name}-*/vendor/*/bin/{name}.exe",
+    )
+    for pattern in patterns:
+        for candidate in sorted(base.glob(pattern)):
+            if candidate.is_file():
+                return str(candidate)
+    return found
+
+
 def _next_attempt(store: Any, pattern: str) -> int:
     return len(list(store.root.glob(pattern))) + 1
 
@@ -552,8 +576,8 @@ def get_adapters(
 
     resolved_timeout = timeout_seconds if timeout_seconds is not None else config.limits.wall_time_seconds
 
-    agy_cmd = tuple(agy_command) if agy_command else (shutil.which("agy") or "agy",)
-    codex_cmd = tuple(codex_command) if codex_command else (shutil.which("codex") or "codex",)
+    agy_cmd = tuple(agy_command) if agy_command else (resolve_executable("agy"),)
+    codex_cmd = tuple(codex_command) if codex_command else (resolve_executable("codex"),)
 
     worker: WorkerAdapter = AgyAdapter(
         store=store, runner=runner, config=config, command=agy_cmd, timeout_seconds=resolved_timeout

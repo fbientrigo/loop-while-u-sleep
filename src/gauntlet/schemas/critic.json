@@ -2,7 +2,7 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "type": "object",
   "additionalProperties": false,
-  "required": ["verdict", "blocking_findings"],
+  "required": ["verdict", "human_decision_required", "blocking_findings"],
   "properties": {
     "verdict": {"enum": ["PASS", "BLOCK"]},
     "human_decision_required": {"type": "boolean"},
