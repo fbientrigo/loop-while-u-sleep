@@ -5,6 +5,7 @@ from datetime import datetime
 import hashlib
 import json
 import os
+import re
 from pathlib import Path
 import threading
 import time
@@ -137,8 +138,8 @@ def compute_fingerprint(finding: dict[str, Any]) -> str:
 
 
 _PROVIDER_MARKERS = (
-    ("provider_quota", ("429", "resource_exhausted", "usage limit", "quota")),
-    ("provider_auth", ("unauthenticated", "not logged in", "please log in", "login required", "401")),
+    ("provider_quota", (r"429", "resource_exhausted", "usage limit", "quota")),
+    ("provider_auth", ("unauthenticated", "not logged in", "please log in", "login required", r"401")),
 )
 
 
@@ -146,7 +147,7 @@ def classify_provider_failure(*texts: str) -> str | None:
     """Name a quota or login failure so the operator knows to wait or log in; never a reason to retry."""
     haystack = " ".join(texts).lower()
     for reason, markers in _PROVIDER_MARKERS:
-        if any(marker in haystack for marker in markers):
+        if any(re.search(marker, haystack) for marker in markers):
             return reason
     return None
 
@@ -542,17 +543,10 @@ class Supervisor:
 
                 self._record_worker_changes(turn)
 
-                protected_file = self.store.root / "protected-manifest.json"
-                if protected_file.exists():
-                    before = json.loads(protected_file.read_text(encoding="utf-8"))
-                    after = self._protected_hashes()
-                    if before != after:
-                        self.store.event(
-                            "EVALUATOR_TAMPERED",
-                            status="BLOCKED",
-                            detail={"turn": turn, "changed": sorted(k for k in before.keys() | after.keys() if before.get(k) != after.get(k))},
-                        )
-                        return self.store.status()
+                changed = self._protected_changes()
+                if changed:
+                    self.store.event("EVALUATOR_TAMPERED", status="BLOCKED", detail={"turn": turn, "changed": changed})
+                    return self.store.status()
 
                 # Check wall-time deadline immediately after worker execution
                 elapsed = recorded_elapsed + (self.clock() - start_clock)
@@ -924,6 +918,17 @@ class Supervisor:
             self.store.event("BASELINE_CHECKS_PASSED", status="RUNNING")
         return True
 
+    def _protected_changes(self) -> list[str]:
+        """Protected evaluator files that differ from the baseline. A missing manifest counts as tampering."""
+        if not self.config.protected:
+            return []
+        try:
+            before = json.loads((self.store.root / "protected-manifest.json").read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            return ["protected-manifest.json"]
+        after = self._protected_hashes()
+        return sorted(k for k in before.keys() | after.keys() if before.get(k) != after.get(k))
+
     def _protected_hashes(self) -> dict[str, str]:
         """Hashes of the evaluator files the worker must not touch (verification.protected globs)."""
         found = {
@@ -936,6 +941,8 @@ class Supervisor:
 
     def _gate_problem(self, turn: int) -> str | None:
         """Re-read the evidence on disk; DONE is refused unless it still shows PASS and green final checks."""
+        if self._protected_changes():
+            return "protected evaluator files changed after the worker turn"
         verdict_file = self.store.root / f"critic-turn-{turn}-verdict.json"
         final_file = self.store.root / f"verification-final-turn-{turn}.json"
         try:

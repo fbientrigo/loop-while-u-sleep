@@ -41,4 +41,6 @@ Start-Process -WindowStyle Hidden gauntlet -ArgumentList 'resume','RUN_ID' `
 | Provider quota or login expiry | `BLOCKED`, reason `provider_quota` / `provider_auth`. Fix, then start a new run. |
 | Wall time or turn limit | `BLOCKED` `LIMIT_REACHED`. |
 
+Before `reconcile --accept`, confirm no agent process from the dead run is still alive (`pgrep -af agy`); a hard kill can leave one editing the worktree.
+
 `gauntlet resume RUN_ID` is also the reconnect command after a crash. It refuses to start if another supervisor holds `run.lock`.
