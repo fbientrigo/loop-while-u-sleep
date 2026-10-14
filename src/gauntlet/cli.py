@@ -13,7 +13,7 @@ from .doctor import DOCTOR_OUTPUT_CHARS, critic_read_only_status, doctor
 from .process import SubprocessRunner
 from .providers import get_adapters, resolve_executable
 from .store import RunStore, StoreError
-from .supervisor import STATUS_DONE, Supervisor, TERMINAL_STATUSES, crash_charge_seconds
+from .supervisor import STATUS_DONE, Supervisor, TERMINAL_STATUSES, crash_charge_seconds, reconcile_run
 from .task import TaskContractError, load_task
 from .worktree import WorktreeError, create_worktree, primary_root, worktree_path
 
@@ -33,6 +33,12 @@ def _main(argv: list[str] | None, stack: ExitStack) -> int:
     status_parser.add_argument("run_id", nargs="?")
     resume_parser = commands.add_parser("resume", help="continue an incomplete run using frozen contract")
     resume_parser.add_argument("run_id")
+    reconcile_parser = commands.add_parser("reconcile", help="operator decision for a worker turn with unknown outcome")
+    reconcile_parser.add_argument("run_id")
+    choice = reconcile_parser.add_mutually_exclusive_group(required=True)
+    choice.add_argument("--accept", action="store_true", help="keep the worktree; resume still runs checks and critic")
+    choice.add_argument("--abandon", action="store_true", help="end the run as BLOCKED")
+    reconcile_parser.add_argument("--note", required=True)
     run_parser = commands.add_parser("run", help="freeze a contract and create an isolated worktree; no worker is launched")
     run_parser.add_argument("objective", nargs="?")
     run_parser.add_argument("--task", type=Path)
@@ -54,6 +60,13 @@ def _main(argv: list[str] | None, stack: ExitStack) -> int:
                 runs = root / ".gauntlet" / "runs"
                 statuses = [RunStore(root, path.name).status() for path in sorted(runs.iterdir())] if runs.is_dir() else []
                 print(json.dumps(statuses, indent=2, sort_keys=True))
+        elif args.command == "reconcile":
+            root = primary_root(Path.cwd(), SubprocessRunner())
+            store = RunStore(root, args.run_id)
+            if not store.root.exists():
+                raise ValueError(f"run not found: {args.run_id}")
+            stack.enter_context(exclusive_lock(store.root / "run.lock", f"run {args.run_id}"))
+            print(json.dumps(reconcile_run(store, worktree_path(root, args.run_id), SubprocessRunner(), accept=args.accept, note=args.note), indent=2, sort_keys=True))
         elif args.command == "resume":
             root = primary_root(Path.cwd(), SubprocessRunner())
             store = RunStore(root, args.run_id)

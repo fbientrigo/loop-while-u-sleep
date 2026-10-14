@@ -136,6 +136,49 @@ def compute_fingerprint(finding: dict[str, Any]) -> str:
     return hashlib.sha256(payload).hexdigest()[:16]
 
 
+_PROVIDER_MARKERS = (
+    ("provider_quota", ("429", "resource_exhausted", "usage limit", "quota")),
+    ("provider_auth", ("unauthenticated", "not logged in", "please log in", "login required", "401")),
+)
+
+
+def classify_provider_failure(*texts: str) -> str | None:
+    """Name a quota or login failure so the operator knows to wait or log in; never a reason to retry."""
+    haystack = " ".join(texts).lower()
+    for reason, markers in _PROVIDER_MARKERS:
+        if any(marker in haystack for marker in markers):
+            return reason
+    return None
+
+
+def reconcile_run(store: RunStore, worktree: Path, runner: Any, *, accept: bool, note: str) -> dict[str, Any]:
+    """Operator decision for a worker turn whose outcome is unknown. Never launches anything.
+
+    accept: keep the worktree as it is. The next resume still runs the checks and the critic.
+    abandon: end the run as BLOCKED. A corrected task starts a new run.
+    """
+    if not note.strip():
+        raise ValueError("reconcile requires a non-empty --note explaining the decision")
+    last = store.events()[-1] if store.events() else {}
+    if last.get("kind") != "WORKER_EXECUTION_UNKNOWN":
+        raise ValueError(f"nothing to reconcile: last event is {last.get('kind')!r}, not WORKER_EXECUTION_UNKNOWN")
+    turn = last["detail"]["turn"]
+    if not accept:
+        store.event("RUN_ABANDONED", status="BLOCKED", detail={"turn": turn, "note": note})
+        return store.status()
+    patch = runner.run(["git", "--no-optional-locks", "diff", "--binary", "HEAD"], cwd=worktree, timeout=60)
+    store.freeze_json(
+        f"reconcile-turn-{turn}.json",
+        {"turn": turn, "decision": "accept", "note": note, "diff_sha256": hashlib.sha256(str(patch.stdout).encode()).hexdigest()},
+    )
+    output = f"worker-turn-{turn}-output.txt"
+    if not (store.root / output).exists():
+        store.freeze_text(output, "(worker output unavailable: turn reconciled by operator)")
+    store.freeze_json(f"worker-turn-{turn}-result.json", {"returncode": 0, "timed_out": False, "reconciled": True})
+    store.event("WORKER_RECONCILED", status="RUNNING", detail={"turn": turn, "note": note})
+    return store.status()
+
+
 def snapshot_manifest(root: Path) -> dict[str, str]:
     manifest: dict[str, str] = {}
     if not root.is_dir():
@@ -499,6 +542,18 @@ class Supervisor:
 
                 self._record_worker_changes(turn)
 
+                protected_file = self.store.root / "protected-manifest.json"
+                if protected_file.exists():
+                    before = json.loads(protected_file.read_text(encoding="utf-8"))
+                    after = self._protected_hashes()
+                    if before != after:
+                        self.store.event(
+                            "EVALUATOR_TAMPERED",
+                            status="BLOCKED",
+                            detail={"turn": turn, "changed": sorted(k for k in before.keys() | after.keys() if before.get(k) != after.get(k))},
+                        )
+                        return self.store.status()
+
                 # Check wall-time deadline immediately after worker execution
                 elapsed = recorded_elapsed + (self.clock() - start_clock)
                 if elapsed >= self.config.limits.wall_time_seconds:
@@ -519,10 +574,11 @@ class Supervisor:
                     return self.store.status()
 
                 if worker_result.returncode != 0:
+                    reason = classify_provider_failure(worker_result.error, worker_result.output) or "non_zero_exit"
                     self.store.event(
                         "WORKER_FAILED",
                         status="BLOCKED",
-                        detail={"turn": turn, "reason": "non_zero_exit", "returncode": worker_result.returncode},
+                        detail={"turn": turn, "reason": reason, "returncode": worker_result.returncode},
                     )
                     return self.store.status()
 
@@ -862,9 +918,21 @@ class Supervisor:
                     detail={"failures": [r.name for r in failed]},
                 )
             return False
+        if not (self.store.root / "protected-manifest.json").exists():
+            self.store.freeze_json("protected-manifest.json", self._protected_hashes())
         if "BASELINE_CHECKS_PASSED" not in [e["kind"] for e in self.store.events()]:
             self.store.event("BASELINE_CHECKS_PASSED", status="RUNNING")
         return True
+
+    def _protected_hashes(self) -> dict[str, str]:
+        """Hashes of the evaluator files the worker must not touch (verification.protected globs)."""
+        found = {
+            path.relative_to(self.worktree).as_posix(): hashlib.sha256(path.read_bytes()).hexdigest()
+            for pattern in self.config.protected
+            for path in self.worktree.glob(pattern)
+            if path.is_file()
+        }
+        return dict(sorted(found.items()))
 
     def _gate_problem(self, turn: int) -> str | None:
         """Re-read the evidence on disk; DONE is refused unless it still shows PASS and green final checks."""

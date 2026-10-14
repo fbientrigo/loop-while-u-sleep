@@ -949,6 +949,20 @@ sys.exit(0 if pathlib.Path('fixed.txt').exists() else 1)
         Supervisor(store2, config, self.task, worktree, self.runner, worker, FakeCriticAdapter.passing()).run()
         self.assertFalse((store2.root / "alive.json").exists())
 
+    def test_worker_editing_a_protected_evaluator_file_is_blocked(self):
+        import dataclasses
+
+        store, worktree, config = self._setup_run()
+        config = dataclasses.replace(config, protected=("eval_*.py",))
+        (worktree / "eval_score.py").write_text("assert True\n", encoding="utf-8")
+        worker = FakeWorkerAdapter([WorkerAction(edits={"eval_score.py": "pass\n", "feature.txt": "x"})])
+        critic = FakeCriticAdapter.passing()
+        final = Supervisor(store, config, self.task, worktree, self.runner, worker, critic).run()
+        self.assertEqual(final["status"], "BLOCKED")
+        self.assertEqual(final["last_event"], "EVALUATOR_TAMPERED")
+        self.assertEqual(store.events()[-1]["detail"]["changed"], ["eval_score.py"])
+        self.assertEqual(len(critic.invocations), 0)
+
     def test_completion_gate_refuses_done_without_matching_evidence(self):
         store, worktree, config = self._setup_run()
         supervisor = Supervisor(store, config, self.task, worktree, self.runner, FakeWorkerAdapter([]), FakeCriticAdapter.passing())
