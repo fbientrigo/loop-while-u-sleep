@@ -6,6 +6,9 @@ from pathlib import Path
 import sys
 
 from contextlib import ExitStack
+from datetime import datetime
+
+import psutil
 
 from .config import ConfigError, init_config, load_config
 from .fsutil import LockHeld, exclusive_lock
@@ -55,10 +58,10 @@ def _main(argv: list[str] | None, stack: ExitStack) -> int:
         elif args.command == "status":
             root = primary_root(Path.cwd(), SubprocessRunner())
             if args.run_id:
-                print(json.dumps(RunStore(root, args.run_id).status(), indent=2, sort_keys=True))
+                print(json.dumps(_status_with_heartbeat(RunStore(root, args.run_id)), indent=2, sort_keys=True))
             else:
                 runs = root / ".gauntlet" / "runs"
-                statuses = [RunStore(root, path.name).status() for path in sorted(runs.iterdir())] if runs.is_dir() else []
+                statuses = [_status_with_heartbeat(RunStore(root, path.name)) for path in sorted(runs.iterdir())] if runs.is_dir() else []
                 print(json.dumps(statuses, indent=2, sort_keys=True))
         elif args.command == "reconcile":
             root = primary_root(Path.cwd(), SubprocessRunner())
@@ -129,6 +132,18 @@ def _main(argv: list[str] | None, stack: ExitStack) -> int:
         print(f"gauntlet: {exc}", file=sys.stderr)
         return 2
     return 0
+
+
+def _status_with_heartbeat(store: RunStore) -> dict:
+    """Status plus, when a supervisor is (or was) running: its pid, seconds since the last beat, and pid liveness."""
+    status = store.status()
+    try:
+        beat = json.loads((store.root / "alive.json").read_text(encoding="utf-8"))
+        age = (datetime.now().astimezone() - datetime.fromisoformat(beat["at"])).total_seconds()
+        status["supervisor"] = {"pid": beat["pid"], "heartbeat_age_seconds": round(age, 1), "pid_alive": psutil.pid_exists(beat["pid"])}
+    except (OSError, ValueError, KeyError):
+        pass  # no heartbeat file: no supervisor is running
+    return status
 
 
 def _prepare(task_path: Path, *, execute: bool = False) -> RunStore:

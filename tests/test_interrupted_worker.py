@@ -99,6 +99,19 @@ class InterruptedWorkerTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             reconcile_run(store, worktree, runner, accept=True, note="again")
 
+    def test_status_reports_supervisor_heartbeat(self):
+        import os
+        from datetime import datetime
+
+        from gauntlet.cli import _status_with_heartbeat
+
+        store, _worktree, _runner, _worker, _ = self._unknown_run()
+        self.assertNotIn("supervisor", _status_with_heartbeat(store))
+        store.write_json("alive.json", {"at": datetime.now().astimezone().isoformat(), "pid": os.getpid()})
+        info = _status_with_heartbeat(store)["supervisor"]
+        self.assertTrue(info["pid_alive"])
+        self.assertLess(info["heartbeat_age_seconds"], 60)
+
     def test_provider_failure_reasons(self):
         self.assertEqual(classify_provider_failure("RESOURCE_EXHAUSTED: 429"), "provider_quota")
         self.assertEqual(classify_provider_failure("", "You have hit your usage limit"), "provider_quota")
