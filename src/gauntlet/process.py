@@ -78,7 +78,7 @@ class SubprocessRunner:
             with subprocess.Popen(
                 list(argv),
                 cwd=cwd,
-                stdin=subprocess.PIPE if input_text is not None else None,
+                stdin=subprocess.PIPE if input_text is not None else subprocess.DEVNULL,  # a child must never wait on the operator's terminal
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
                 text=True,

@@ -142,7 +142,7 @@ def _version(argv: list[str], runner: ProcessRunner) -> str | None:
 def _capture(runner: ProcessRunner, argv: list[str]) -> str:
     if not argv or not argv[0]:
         return ""
-    result = runner.run(argv)
+    result = runner.run(argv, timeout=120)
     return f"{result.stdout}\n{result.stderr}"
 
 
